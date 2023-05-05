@@ -87,6 +87,7 @@ func (self ECRHelper) Get(serverURL string) (string, string, error) {
 			WithError(err).
 			WithField("serverURL", serverURL).
 			Error("Error parsing the serverURL")
+		fmt.Println(serverURL)
 		return "", "", credentials.NewErrCredentialsNotFound()
 	}
 

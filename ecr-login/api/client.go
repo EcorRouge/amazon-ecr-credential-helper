@@ -28,6 +28,12 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/awslabs/amazon-ecr-credential-helper/ecr-login/cache"
+
+	"encoding/json"
+	"errors"
+	"io/ioutil"
+	"net/http"
+	"os"
 )
 
 const (
@@ -52,6 +58,12 @@ type Registry struct {
 	ID      string
 	FIPS    bool
 	Region  string
+}
+
+type RevelesAuthResponse struct {
+	AuthorizationToken string
+	ExpiresAt          time.Time
+	ProxyEndpoint      string
 }
 
 // ExtractRegistry returns the ECR registry behind a given service endpoint
@@ -205,51 +217,131 @@ func (c *defaultClient) ListCredentials() ([]*Auth, error) {
 	return auths, nil
 }
 
-func (c *defaultClient) getAuthorizationToken(registryID string) (*Auth, error) {
-	var input *ecr.GetAuthorizationTokenInput
-	if registryID == "" {
-		logrus.Debug("Calling ECR.GetAuthorizationToken for default registry")
-		input = &ecr.GetAuthorizationTokenInput{}
-	} else {
-		logrus.WithField("registry", registryID).Debug("Calling ECR.GetAuthorizationToken")
-		input = &ecr.GetAuthorizationTokenInput{
-			RegistryIds: []string{registryID},
-		}
+func (c *defaultClient) GetAuthorizationTokenFromRevelesApi() (*RevelesAuthResponse, error) {
+
+	// https://api-test.reveles.ai/processing_cluster/ecr
+	tokenEndpoint := os.Getenv("REV_ECR_TOKEN_ENDPOINT")
+	if tokenEndpoint == "" {
+		return nil, errors.New("REV_ECR_TOKEN_ENDPOINT environment variable is undefined")
 	}
 
-	output, err := c.ecrClient.GetAuthorizationToken(context.TODO(), input)
-	if err != nil || output == nil {
+	tokenEndpointKey := os.Getenv("REV_ECR_TOKEN_ENDPOINT_KEY")
+	if tokenEndpointKey == "" {
+		return nil, errors.New("REV_ECR_TOKEN_ENDPOINT_KEY environment variable is undefined")
+	}
+
+	// Create a new HTTP client
+	client := &http.Client{}
+
+	// Create a new GET request
+	req, err := http.NewRequest("GET", tokenEndpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the headers
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer " + tokenEndpointKey)
+
+	// Send the request
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Print the response status code
+	// fmt.Println(resp.Status)
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Request failed with status code %d", resp.StatusCode)
+	}
+
+	//output := ecr.GetAuthorizationTokenOutput{}
+	authResponse := RevelesAuthResponse{}
+
+	err = json.Unmarshal(body, &authResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	//fmt.Printf("%#v", authResponse)
+	return &authResponse, err
+}
+
+func (this *RevelesAuthResponse) UnmarshalJSON(data []byte) error {
+	var f interface{}
+	err := json.Unmarshal(data, &f)
+	if err != nil {
+		return err
+	}
+	m := f.(map[string]interface{})
+	for k, v := range m {
+		switch k {
+		case "authorizationToken":
+			this.AuthorizationToken = v.(string)
+		case "expiresAt":
+			this.ExpiresAt = time.Unix(int64(v.(float64)), 0)
+		case "proxyEndpoint":
+			this.ProxyEndpoint = v.(string)
+		}
+	}
+	return nil
+}
+
+func (c *defaultClient) getAuthorizationToken(registryID string) (*Auth, error) {
+
+	// // anikiforov: if needed, can compare registries & default to the standard
+	// // ecr credential helper behavior if the registry does not match Reveles ECR registry
+	//
+	// var input *ecr.GetAuthorizationTokenInput
+	// if registryID == "" {
+	//	logrus.Debug("Calling ECR.GetAuthorizationToken for default registry")
+	//	input = &ecr.GetAuthorizationTokenInput{}
+	//} else {
+	//	logrus.WithField("registry", registryID).Debug("Calling ECR.GetAuthorizationToken")
+	//	input = &ecr.GetAuthorizationTokenInput{
+	//		RegistryIds: []string{registryID},
+	//	}
+	//	}
+
+	authData, err := c.GetAuthorizationTokenFromRevelesApi() // c.ecrClient.GetAuthorizationToken(context.TODO(), input)
+	if err != nil || authData == nil {
 		if err == nil {
 			if registryID == "" {
-				err = fmt.Errorf("missing AuthorizationData in ECR response for default registry")
+				err = fmt.Errorf("missing AuthorizationData in RevelesApi response for default registry")
 			} else {
-				err = fmt.Errorf("missing AuthorizationData in ECR response for %s", registryID)
+				err = fmt.Errorf("missing AuthorizationData in RevelesApi response for %s", registryID)
 			}
 		}
 		return nil, fmt.Errorf("ecr: Failed to get authorization token: %w", err)
 	}
 
-	for _, authData := range output.AuthorizationData {
-		if authData.ProxyEndpoint != nil && authData.AuthorizationToken != nil {
-			authEntry := cache.AuthEntry{
-				AuthorizationToken: aws.ToString(authData.AuthorizationToken),
-				RequestedAt:        time.Now(),
-				ExpiresAt:          aws.ToTime(authData.ExpiresAt),
-				ProxyEndpoint:      aws.ToString(authData.ProxyEndpoint),
-				Service:            cache.ServiceECR,
-			}
-			registry, err := ExtractRegistry(authEntry.ProxyEndpoint)
-			if err != nil {
-				return nil, fmt.Errorf("Invalid ProxyEndpoint returned by ECR: %s", authEntry.ProxyEndpoint)
-			}
-			auth, err := extractToken(authEntry.AuthorizationToken, authEntry.ProxyEndpoint)
-			if err != nil {
-				return nil, err
-			}
-			c.credentialCache.Set(registry.ID, &authEntry)
-			return auth, nil
+	if authData.ProxyEndpoint != "" && authData.AuthorizationToken != "" {
+		authEntry := cache.AuthEntry{
+			AuthorizationToken: authData.AuthorizationToken,
+			RequestedAt:        time.Now(),
+			ExpiresAt:          authData.ExpiresAt,
+			ProxyEndpoint:      authData.ProxyEndpoint,
+			Service:            cache.ServiceECR,
 		}
+		registry, err := ExtractRegistry(authEntry.ProxyEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("Invalid ProxyEndpoint returned by ECR: %s", authEntry.ProxyEndpoint)
+		}
+		auth, err := extractToken(authEntry.AuthorizationToken, authEntry.ProxyEndpoint)
+		if err != nil {
+			return nil, err
+		}
+		c.credentialCache.Set(registry.ID, &authEntry)
+		return auth, nil
 	}
+
 	if registryID == "" {
 		return nil, fmt.Errorf("No AuthorizationToken found for default registry")
 	}
