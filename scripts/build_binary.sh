@@ -40,6 +40,6 @@ GOOS=${TARGET_GOOS:-} GOARCH=${TARGET_GOARCH:-} CGO_ENABLED=0 \
        	-a \
         -gcflags "all=-N -l" \
        	-trimpath \
-       	-o ../$1/docker-credential-ecr-login \
+       	-o ../$1/docker-credential-rev-ecr-login \
 	./cli/docker-credential-ecr-login
         # -ldflags "-buildid= -s ${version_ldflags}" \
